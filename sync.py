@@ -281,7 +281,7 @@ def rubric_markdown(rubric):
     return '<table header-row="true">\n' + "\n".join(rows) + "\n</table>"
 
 
-def details_markdown(description_html=None, facts=(), rubric=None):
+def details_markdown(description_html=None, facts=(), rubric=None, heading="Instrucciones"):
     base_url = f"https://{CANVAS_DOMAIN}"
     parts = []
     facts = [fact for fact in facts if fact]
@@ -289,7 +289,7 @@ def details_markdown(description_html=None, facts=(), rubric=None):
         parts.append("\n".join(f"- {fact}" for fact in facts))
     description = html_to_notion_markdown(description_html, base_url)
     if description:
-        parts.append(f"### Instrucciones\n{description}")
+        parts.append(f"### {heading}\n{description}")
     if rubric:
         parts.append(f"### Rúbrica\n{rubric_markdown(rubric)}")
     return "\n\n".join(parts)
@@ -499,7 +499,7 @@ def upsert_announcement(data_source_id, announcement, course_names):
 
     author = (announcement.get("author") or {}).get("display_name")
     facts = [f"**Publicado por:** {escape_text(author)}"] if author else []
-    sync_page_details(page["id"], details_markdown(announcement.get("message"), facts))
+    sync_page_details(page["id"], details_markdown(announcement.get("message"), facts, heading="Mensaje"))
 
 
 def upsert_module_resource(data_source_id, course_id, item, course_names):
@@ -532,7 +532,7 @@ def upsert_module_resource(data_source_id, course_id, item, course_names):
     if item.get("type") == "Page" and item.get("url"):
         canvas_page = canvas_get_optional(item["url"])
         if canvas_page:
-            sync_page_details(page["id"], details_markdown(canvas_page.get("body")))
+            sync_page_details(page["id"], details_markdown(canvas_page.get("body"), heading="Contenido"))
 
 
 def upsert_course_grade(data_source_id, course_id, course_name, course_grades):
