@@ -19,3 +19,6 @@ jobs:
           CANVAS_TOKEN: ${{ secrets.CANVAS_TOKEN }}
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          ARCHIVE_OVERDUE_AFTER_DAYS: ${{ secrets.ARCHIVE_OVERDUE_AFTER_DAYS }}
+          ANNOUNCEMENTS_LOOKBACK_DAYS: ${{ secrets.ANNOUNCEMENTS_LOOKBACK_DAYS }}
+          TIMEZONE: ${{ secrets.TIMEZONE }}
