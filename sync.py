@@ -457,6 +457,10 @@ def upsert_item(data_source_id, item, assignments):
             properties["Status"] = {"status": {"name": "Done"}}
         page = notion.pages.update(page_id=existing["id"], properties=properties)
         print(f"Actualizado: {name}")
+    elif is_stale(item.get("plannable_date"), canvas_complete):
+        # Ya se archivó en una corrida anterior (o se archivaría al final de
+        # esta): el planner lo sigue devolviendo, pero no se vuelve a crear.
+        return
     else:
         if canvas_complete:
             properties["Status"] = {"status": {"name": "Done"}}
@@ -567,6 +571,15 @@ def upsert_course_grade(data_source_id, course_id, course_name, course_grades):
             properties=properties,
         )
         print(f"Creado (nota general): {course_name}")
+
+
+def is_stale(due_date, done):
+    # Mismo criterio que archive_stale_items, para un item que aún no está en Notion.
+    if not due_date:
+        return False
+    due = datetime.fromisoformat(due_date.replace("Z", "+00:00")).astimezone(timezone.utc).date()
+    today = datetime.now(timezone.utc).date()
+    return (done and due < today) or due < today - timedelta(days=ARCHIVE_OVERDUE_AFTER_DAYS)
 
 
 def archive_stale_items(data_source_id):
