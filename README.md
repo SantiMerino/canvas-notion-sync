@@ -44,6 +44,10 @@ python sync.py
   - Anuncios: el mensaje completo. Páginas de módulos: el contenido de la página.
   - El HTML de Canvas se convierte a markdown de Notion ([notion_markdown.py](notion_markdown.py)) y se escribe con `PATCH /v1/pages/:id/markdown` (API `2026-03-11`). Las ecuaciones del editor de Canvas quedan como ecuaciones de Notion; las imágenes quedan como link porque requieren sesión de Canvas.
   - Debajo queda un encabezado **✍️ Mis notas**: todo lo que escribas ahí no se toca. La sección de Canvas se reemplaza solo cuando cambia algo en Canvas (lleva un `ref:` con un hash en su pie), así que no edites dentro de ella.
+- Propiedades extra para priorizar (se crean solas si faltan): `Puntos`, `Entrega` (Sin entregar / Entregado / Tarde / Calificado / Faltante / No aplica), `Nota %`, y las fórmulas `Días restantes` y `Urgencia` (⚫ Vencida / 🔴 Alta ≤48 h / 🟠 Media ≤7 días / 🟢 Baja). Si Canvas dice que ya entregaste, el item pasa a `Done`.
+- `Resumen`, `Esfuerzo (h)` y `Revisar con IA` no las escribe el script: son para Notion AI (autofill) y los Custom Agents.
+- Los PDFs de los módulos se copian dentro de su página de Notion (File Upload API, una sola vez por archivo) para que Notion AI los pueda leer.
+- Solo se escriben las propiedades que cambiaron, para no marcar todas las páginas como editadas en cada corrida.
 - Al final de cada corrida, archiva (Notion `archived: true`, recuperable desde la papelera) las tareas vencidas: de inmediato si ya están en `Done`, o después de `ARCHIVE_OVERDUE_AFTER_DAYS` días si nunca se marcaron como completadas. Anuncios, recursos y notas generales no tienen `Due Date`, así que nunca se archivan solos.
 - Sync bidireccional parcial, limitado al flag de "completado" (nunca toca entregas ni calificaciones):
   - Canvas → Notion: si el item está marcado como hecho en el To-Do de Canvas (`planner_override.marked_complete`), se pone `Status = Done` en Notion.

@@ -91,16 +91,64 @@ REQUIRED_PROPERTIES = {
     "Canvas Link": {"url": {}},
     "Canvas ID": {"rich_text": {}},
     "Grade": {"rich_text": {}},
+    "Puntos": {"number": {}},
+    "Nota %": {"number": {}},
+    "Entrega": {
+        "select": {
+            "options": [
+                {"name": "Sin entregar", "color": "gray"},
+                {"name": "Entregado", "color": "blue"},
+                {"name": "Tarde", "color": "orange"},
+                {"name": "Calificado", "color": "green"},
+                {"name": "Faltante", "color": "red"},
+                {"name": "No aplica", "color": "default"},
+            ]
+        }
+    },
+    # Las llena Notion AI (autofill) y los Custom Agents, no el script.
+    "Resumen": {"rich_text": {}},
+    "Esfuerzo (h)": {"number": {}},
+    "Revisar con IA": {"checkbox": {}},
+}
+
+TASK_TYPES_FORMULA = (
+    '(prop("Type") == "Assignment" or prop("Type") == "Quiz" or prop("Type") == "Discussion Topic")'
+)
+
+# Fórmulas: se calculan solas en Notion (gratis y siempre al día), por eso no
+# las escribe el script. Van después del resto porque dependen de "Entrega".
+FORMULA_PROPERTIES = {
+    "Días restantes": {"formula": {"expression": 'dateBetween(prop("Due Date"), now(), "days")'}},
+    "Urgencia": {
+        "formula": {
+            "expression": (
+                f'if(not {TASK_TYPES_FORMULA} or empty(prop("Due Date")) or prop("Status") == "Done"'
+                ' or prop("Entrega") == "Entregado" or prop("Entrega") == "Calificado"'
+                ' or prop("Entrega") == "Tarde", "",'
+                ' if(dateBetween(prop("Due Date"), now(), "hours") < 0, "⚫ Vencida",'
+                ' if(dateBetween(prop("Due Date"), now(), "hours") <= 48, "🔴 Alta",'
+                ' if(dateBetween(prop("Due Date"), now(), "hours") <= 168, "🟠 Media", "🟢 Baja"))))'
+            )
+        }
+    },
 }
 
 
 def ensure_schema(data_source_id):
     data_source = notion.data_sources.retrieve(data_source_id=data_source_id)
     existing = data_source.get("properties") or {}
-    missing = {name: config for name, config in REQUIRED_PROPERTIES.items() if name not in existing}
-    if missing:
-        notion.data_sources.update(data_source_id=data_source_id, properties=missing)
-        print(f"Propiedades creadas en Notion: {', '.join(missing)}")
+    for group in (REQUIRED_PROPERTIES, FORMULA_PROPERTIES):
+        missing = {name: config for name, config in group.items() if name not in existing}
+        if not missing:
+            continue
+        try:
+            notion.data_sources.update(data_source_id=data_source_id, properties=missing)
+            print(f"Propiedades creadas en Notion: {', '.join(missing)}")
+        except APIResponseError as error:
+            if group is REQUIRED_PROPERTIES:
+                raise
+            # Una fórmula inválida no debería frenar el sync.
+            print(f"  ⚠️ No se pudieron crear las fórmulas {', '.join(missing)}: {error}")
 
 
 def canvas_get_paginated(url, params=None):
@@ -213,6 +261,113 @@ def find_existing_page(data_source_id, canvas_id):
 def get_notion_status(page):
     status = (page.get("properties", {}).get("Status") or {}).get("status")
     return status["name"] if status else None
+
+
+def property_value(prop):
+    # Normaliza una propiedad (tal como la devuelve Notion o como la mandamos)
+    # a un valor comparable.
+    if not prop:
+        return None
+    for kind in ("title", "rich_text"):
+        if kind in prop:
+            return "".join(
+                part.get("plain_text") or part.get("text", {}).get("content", "")
+                for part in prop[kind] or []
+            )
+    for kind in ("select", "status"):
+        if kind in prop:
+            return (prop[kind] or {}).get("name")
+    if "date" in prop:
+        start = (prop["date"] or {}).get("start")
+        return datetime.fromisoformat(start.replace("Z", "+00:00")) if start else None
+    for kind in ("url", "number", "checkbox"):
+        if kind in prop:
+            return prop[kind]
+    return None
+
+
+def update_page(page, properties):
+    # Solo escribe lo que cambió. Reescribir todo en cada corrida gasta llamadas
+    # a la API y marca cada página como editada cada 3 horas.
+    current = page.get("properties", {})
+    changed = {
+        name: value
+        for name, value in properties.items()
+        if property_value(value) != property_value(current.get(name))
+    }
+    if changed:
+        notion.pages.update(page_id=page["id"], properties=changed)
+    return bool(changed)
+
+
+def submission_label(assignment):
+    types = set(assignment.get("submission_types") or [])
+    if not types or types <= {"none", "on_paper"}:
+        return "No aplica"
+    submission = assignment.get("submission") or {}
+    state = submission.get("workflow_state")
+    if submission.get("missing"):
+        return "Faltante"
+    if submission.get("submitted_at"):
+        if submission.get("late"):
+            return "Tarde"
+        return "Calificado" if state == "graded" else "Entregado"
+    if state == "graded":
+        return "Calificado"
+    return "Sin entregar"
+
+
+NOTION_SINGLE_PART_LIMIT = 20 * 1024 * 1024
+NOTION_PART_SIZE = 10 * 1024 * 1024
+
+
+def upload_to_notion(filename, content, content_type):
+    if len(content) <= NOTION_SINGLE_PART_LIMIT:
+        upload = notion.file_uploads.create(
+            mode="single_part", filename=filename, content_type=content_type
+        )
+        notion.file_uploads.send(file_upload_id=upload["id"], file=(filename, content, content_type))
+        return upload["id"]
+
+    parts = [content[i : i + NOTION_PART_SIZE] for i in range(0, len(content), NOTION_PART_SIZE)]
+    upload = notion.file_uploads.create(
+        mode="multi_part", filename=filename, content_type=content_type, number_of_parts=len(parts)
+    )
+    for number, part in enumerate(parts, start=1):
+        notion.file_uploads.send(
+            file_upload_id=upload["id"], file=(filename, part, content_type), part_number=str(number)
+        )
+    notion.file_uploads.complete(file_upload_id=upload["id"])
+    return upload["id"]
+
+
+def sync_pdf(page_id, item):
+    # Copia el PDF de Canvas dentro de la página de Notion para que Notion AI
+    # pueda leerlo. Se sube una sola vez: si la página ya tiene un PDF, no se toca.
+    try:
+        children = notion.blocks.children.list(block_id=page_id, page_size=50)["results"]
+        if any(block["type"] == "pdf" for block in children):
+            return
+        file_info = canvas_get_optional(item["url"])
+        if not file_info or file_info.get("content-type") != "application/pdf" or not file_info.get("url"):
+            return
+        resp = requests.get(file_info["url"], headers=CANVAS_HEADERS)
+        resp.raise_for_status()
+        filename = file_info.get("display_name") or file_info.get("filename") or "archivo.pdf"
+        upload_id = upload_to_notion(filename, resp.content, "application/pdf")
+
+        blocks = [{"type": "pdf", "pdf": {"type": "file_upload", "file_upload": {"id": upload_id}}}]
+        if not children:
+            blocks.append(
+                {
+                    "type": "heading_2",
+                    "heading_2": {"rich_text": [{"type": "text", "text": {"content": "✍️ Mis notas"}}]},
+                }
+            )
+        notion.blocks.children.append(block_id=page_id, children=blocks)
+        print(f"  PDF copiado a Notion: {filename}")
+    except (APIResponseError, requests.RequestException) as error:
+        print(f"  ⚠️ No se pudo copiar el PDF a {page_id}: {error}")
 
 
 def build_canvas_link(html_url):
@@ -443,6 +598,19 @@ def upsert_item(data_source_id, item, assignments):
                 }
             ]
         }
+        if assignment.get("points_possible"):
+            percent = submission["score"] / assignment["points_possible"] * 100
+            properties["Nota %"] = {"number": round(percent, 2)}
+
+    delivered = False
+    if assignment:
+        label = submission_label(assignment)
+        properties["Entrega"] = {"select": {"name": label}}
+        delivered = label in ("Entregado", "Tarde", "Calificado")
+        if assignment.get("points_possible") is not None:
+            properties["Puntos"] = {"number": assignment["points_possible"]}
+    # Entregado en Canvas (o marcado en su To-Do) cuenta como hecho.
+    done_in_canvas = canvas_complete or delivered
 
     existing = find_existing_page(data_source_id, canvas_id)
     name = properties["Name"]["title"][0]["text"]["content"]
@@ -452,17 +620,18 @@ def upsert_item(data_source_id, item, assignments):
         if notion_done and not canvas_complete:
             # Notion -> Canvas: el estudiante lo marcó "Done" en Notion.
             mark_canvas_complete(item)
-        elif canvas_complete and not notion_done:
-            # Canvas -> Notion: se marcó como hecho desde el To-Do de Canvas.
+        elif done_in_canvas and not notion_done:
+            # Canvas -> Notion: se entregó o se marcó como hecho en Canvas.
             properties["Status"] = {"status": {"name": "Done"}}
-        page = notion.pages.update(page_id=existing["id"], properties=properties)
-        print(f"Actualizado: {name}")
-    elif is_stale(item.get("plannable_date"), canvas_complete):
+        page = existing
+        if update_page(existing, properties):
+            print(f"Actualizado: {name}")
+    elif is_stale(item.get("plannable_date"), done_in_canvas):
         # Ya se archivó en una corrida anterior (o se archivaría al final de
         # esta): el planner lo sigue devolviendo, pero no se vuelve a crear.
         return
     else:
-        if canvas_complete:
+        if done_in_canvas:
             properties["Status"] = {"status": {"name": "Done"}}
         page = notion.pages.create(
             parent={"type": "data_source_id", "data_source_id": data_source_id},
@@ -492,8 +661,9 @@ def upsert_announcement(data_source_id, announcement, course_names):
     name = properties["Name"]["title"][0]["text"]["content"]
 
     if existing:
-        page = notion.pages.update(page_id=existing["id"], properties=properties)
-        print(f"Actualizado (anuncio): {name}")
+        page = existing
+        if update_page(existing, properties):
+            print(f"Actualizado (anuncio): {name}")
     else:
         page = notion.pages.create(
             parent={"type": "data_source_id", "data_source_id": data_source_id},
@@ -522,8 +692,9 @@ def upsert_module_resource(data_source_id, course_id, item, course_names):
     name = properties["Name"]["title"][0]["text"]["content"]
 
     if existing:
-        page = notion.pages.update(page_id=existing["id"], properties=properties)
-        print(f"Actualizado (recurso): {name}")
+        page = existing
+        if update_page(existing, properties):
+            print(f"Actualizado (recurso): {name}")
     else:
         page = notion.pages.create(
             parent={"type": "data_source_id", "data_source_id": data_source_id},
@@ -531,12 +702,14 @@ def upsert_module_resource(data_source_id, course_id, item, course_names):
         )
         print(f"Creado (recurso): {name}")
 
-    # Las páginas de Canvas tienen su contenido propio; el resto de recursos
-    # (archivos, links) se quedan solo con el link.
+    # Las páginas de Canvas traen su contenido y los PDFs se copian enteros;
+    # el resto de recursos (links, otros archivos) se quedan solo con el link.
     if item.get("type") == "Page" and item.get("url"):
         canvas_page = canvas_get_optional(item["url"])
         if canvas_page:
             sync_page_details(page["id"], details_markdown(canvas_page.get("body"), heading="Contenido"))
+    elif item.get("type") == "File" and item.get("url"):
+        sync_pdf(page["id"], item)
 
 
 def upsert_course_grade(data_source_id, course_id, course_name, course_grades):
@@ -559,12 +732,14 @@ def upsert_course_grade(data_source_id, course_id, course_name, course_grades):
         "Canvas Link": {"url": build_canvas_link(grade.get("html_url"))},
         "Grade": {"rich_text": [{"text": {"content": text}}]},
     }
+    if score is not None:
+        properties["Nota %"] = {"number": score}
 
     existing = find_existing_page(data_source_id, canvas_id)
 
     if existing:
-        notion.pages.update(page_id=existing["id"], properties=properties)
-        print(f"Actualizado (nota general): {course_name}")
+        if update_page(existing, properties):
+            print(f"Actualizado (nota general): {course_name}")
     else:
         notion.pages.create(
             parent={"type": "data_source_id", "data_source_id": data_source_id},
