@@ -1,8 +1,13 @@
+import hashlib
 import os
+import re
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
-from notion_client import Client
+from notion_client import APIResponseError, Client
+
+from notion_markdown import escape_text, html_to_notion_markdown
 
 CANVAS_DOMAIN = os.environ["CANVAS_DOMAIN"]  # ej. tuescuela.instructure.com
 CANVAS_TOKEN = os.environ["CANVAS_TOKEN"]
@@ -11,13 +16,46 @@ NOTION_DATABASE_ID = os.environ["NOTION_DATABASE_ID"]
 
 # Tareas vencidas y sin completar se archivan solas pasado este tiempo, para
 # que no se acumulen indefinidamente. Configurable vía secret opcional.
-ARCHIVE_OVERDUE_AFTER_DAYS = int(os.environ.get("ARCHIVE_OVERDUE_AFTER_DAYS", "30"))
+ARCHIVE_OVERDUE_AFTER_DAYS = int(os.environ.get("ARCHIVE_OVERDUE_AFTER_DAYS") or "30")
 
 # Cuántos días atrás de anuncios traer en cada corrida. Los anuncios no
 # cambian una vez posteados, así que no hace falta mirar más atrás de esto.
-ANNOUNCEMENTS_LOOKBACK_DAYS = int(os.environ.get("ANNOUNCEMENTS_LOOKBACK_DAYS", "30"))
+ANNOUNCEMENTS_LOOKBACK_DAYS = int(os.environ.get("ANNOUNCEMENTS_LOOKBACK_DAYS") or "30")
+
+# Zona horaria para mostrar fechas dentro del contenido de cada página
+# (ej. "America/El_Salvador"). Las propiedades de fecha no dependen de esto.
+TIMEZONE = os.environ.get("TIMEZONE") or "UTC"
 
 CANVAS_HEADERS = {"Authorization": f"Bearer {CANVAS_TOKEN}"}
+
+# El contenido de cada página tiene una sección que maneja el script (entre
+# estos dos encabezados) y el resto queda libre para las notas del estudiante.
+# La sección se reescribe solo cuando cambia lo que viene de Canvas, detectado
+# con el hash que va en su pie ("ref:...").
+DETAILS_HEADING = "## 📌 Detalles de Canvas"
+NOTES_HEADING = "## ✍️ Mis notas"
+DETAILS_FOOTER = "Se actualiza solo desde Canvas en cada sync; no edites esta sección."
+DETAILS_REF = re.compile(r"ref:([0-9a-f]{10})")
+
+SUBMISSION_TYPE_LABELS = {
+    "online_upload": "Subir archivo",
+    "online_text_entry": "Texto en línea",
+    "online_url": "URL",
+    "media_recording": "Grabación de audio/video",
+    "student_annotation": "Anotación en documento",
+    "online_quiz": "Quiz",
+    "discussion_topic": "Discusión",
+    "external_tool": "Herramienta externa",
+    "on_paper": "En papel",
+    "none": "Sin entrega en Canvas",
+}
+
+SUBMISSION_STATE_LABELS = {
+    "unsubmitted": "Sin entregar",
+    "submitted": "Entregado",
+    "pending_review": "En revisión",
+    "graded": "Calificado",
+}
 
 # Tipos de item de módulo que son recursos de contenido (material subido por
 # el profesor). El resto (Assignment, Quiz, Discussion, SubHeader) ya llega
@@ -30,6 +68,9 @@ MODULE_RESOURCE_TYPE_LABELS = {
 }
 
 notion = Client(auth=NOTION_TOKEN)
+# Los endpoints de markdown (/v1/pages/:id/markdown) solo existen desde esta
+# versión de la API; el resto del script se queda en la versión por defecto.
+notion_md = Client(auth=NOTION_TOKEN, notion_version="2026-03-11")
 
 
 def get_data_source_id():
@@ -37,6 +78,29 @@ def get_data_source_id():
     # can have multiple sources). Queries/creates go through the data source.
     database = notion.databases.retrieve(database_id=NOTION_DATABASE_ID)
     return database["data_sources"][0]["id"]
+
+
+# Propiedades que el script necesita en la base. Si falta alguna (ej. una base
+# recién creada que solo tiene "Name"), se crea al inicio de cada corrida; las
+# opciones de los selects las va agregando Notion solo a medida que llegan.
+REQUIRED_PROPERTIES = {
+    "Course": {"select": {}},
+    "Type": {"select": {}},
+    "Due Date": {"date": {}},
+    "Status": {"status": {}},
+    "Canvas Link": {"url": {}},
+    "Canvas ID": {"rich_text": {}},
+    "Grade": {"rich_text": {}},
+}
+
+
+def ensure_schema(data_source_id):
+    data_source = notion.data_sources.retrieve(data_source_id=data_source_id)
+    existing = data_source.get("properties") or {}
+    missing = {name: config for name, config in REQUIRED_PROPERTIES.items() if name not in existing}
+    if missing:
+        notion.data_sources.update(data_source_id=data_source_id, properties=missing)
+        print(f"Propiedades creadas en Notion: {', '.join(missing)}")
 
 
 def canvas_get_paginated(url, params=None):
@@ -93,22 +157,34 @@ def fetch_module_resources(course_ids):
     return resources
 
 
-def fetch_assignment_grades(course_ids):
-    # notas de actividades individuales, vistas desde la propia entrega del
-    # estudiante (no requiere acceso de profesor/gradebook).
-    grades = {}
+def fetch_assignments(course_ids):
+    # Todas las tareas de los cursos activos con la propia entrega del
+    # estudiante (no requiere acceso de profesor/gradebook). Trae descripción,
+    # rúbrica y reglas de entrega para el contenido de la página, y la nota.
+    # Se indexan por el tipo/id con el que aparecen en el planner: los quizzes
+    # y discusiones calificadas también tienen una tarea asociada.
+    index = {}
     for course_id in course_ids:
         url = f"https://{CANVAS_DOMAIN}/api/v1/courses/{course_id}/assignments"
         assignments = canvas_get_paginated(url, {"per_page": 50, "include[]": "submission"})
         for assignment in assignments:
-            submission = assignment.get("submission") or {}
-            if submission.get("score") is not None:
-                grades[assignment["id"]] = {
-                    "score": submission["score"],
-                    "points_possible": assignment.get("points_possible"),
-                    "letter": submission.get("grade"),
-                }
-    return grades
+            index[("assignment", assignment["id"])] = assignment
+            if assignment.get("quiz_id"):
+                index[("quiz", assignment["quiz_id"])] = assignment
+            topic = assignment.get("discussion_topic") or {}
+            if topic.get("id"):
+                index[("discussion_topic", topic["id"])] = assignment
+    return index
+
+
+def canvas_get_optional(url):
+    # Para contenido que puede estar bloqueado para el estudiante (módulos aún
+    # no liberados, quizzes ocultos): si Canvas lo niega, se sigue sin él.
+    resp = requests.get(url, headers=CANVAS_HEADERS)
+    if resp.status_code in (401, 403, 404):
+        return None
+    resp.raise_for_status()
+    return resp.json()
 
 
 def fetch_course_grades():
@@ -149,6 +225,173 @@ def build_canvas_link(html_url):
     return f"https://{CANVAS_DOMAIN}{html_url}"
 
 
+def local_timezone():
+    try:
+        return ZoneInfo(TIMEZONE)
+    except ZoneInfoNotFoundError:
+        return timezone.utc
+
+
+def date_mention(iso_datetime):
+    # Fecha clickeable de Notion (se puede usar para recordatorios).
+    tz = local_timezone()
+    moment = datetime.fromisoformat(iso_datetime.replace("Z", "+00:00")).astimezone(tz)
+    return (
+        f'<mention-date start="{moment:%Y-%m-%d}" startTime="{moment:%H:%M}" '
+        f'timeZone="{getattr(tz, "key", "UTC")}"/>'
+    )
+
+
+def format_number(value):
+    return f"{value:g}" if isinstance(value, float) else str(value)
+
+
+def submission_summary(submission):
+    state = submission.get("workflow_state")
+    if not state:
+        return None
+    text = SUBMISSION_STATE_LABELS.get(state, state)
+    if submission.get("submitted_at"):
+        text += f" el {date_mention(submission['submitted_at'])}"
+    if submission.get("attempt"):
+        text += f" (intento {submission['attempt']})"
+    if submission.get("late"):
+        text += " · **tarde**"
+    if submission.get("missing"):
+        text += " · **faltante**"
+    return text
+
+
+def rubric_markdown(rubric):
+    rows = ["\t<tr>\n\t\t<td>Criterio</td>\n\t\t<td>Niveles</td>\n\t\t<td>Pts</td>\n\t</tr>"]
+    for criterion in rubric:
+        name = f"**{escape_text(criterion.get('description'))}**"
+        if criterion.get("long_description"):
+            name += f"<br>{escape_text(criterion['long_description'])}"
+        levels = []
+        for rating in criterion.get("ratings") or []:
+            level = f"**{escape_text(rating.get('description'))}** ({format_number(rating.get('points'))})"
+            if rating.get("long_description"):
+                level += f": {escape_text(rating['long_description'])}"
+            levels.append(level)
+        rows.append(
+            f"\t<tr>\n\t\t<td>{name}</td>\n\t\t<td>{'<br>'.join(levels)}</td>\n"
+            f"\t\t<td>{format_number(criterion.get('points'))}</td>\n\t</tr>"
+        )
+    return '<table header-row="true">\n' + "\n".join(rows) + "\n</table>"
+
+
+def details_markdown(description_html=None, facts=(), rubric=None):
+    base_url = f"https://{CANVAS_DOMAIN}"
+    parts = []
+    facts = [fact for fact in facts if fact]
+    if facts:
+        parts.append("\n".join(f"- {fact}" for fact in facts))
+    description = html_to_notion_markdown(description_html, base_url)
+    if description:
+        parts.append(f"### Instrucciones\n{description}")
+    if rubric:
+        parts.append(f"### Rúbrica\n{rubric_markdown(rubric)}")
+    return "\n\n".join(parts)
+
+
+def assignment_facts(assignment):
+    facts = []
+    if assignment.get("points_possible") is not None:
+        facts.append(f"**Puntos:** {format_number(assignment['points_possible'])}")
+    types = [SUBMISSION_TYPE_LABELS.get(t, t) for t in assignment.get("submission_types") or []]
+    if types:
+        facts.append(f"**Tipo de entrega:** {', '.join(types)}")
+    if assignment.get("allowed_extensions"):
+        facts.append(f"**Formatos permitidos:** {escape_text(', '.join(assignment['allowed_extensions']))}")
+    attempts = assignment.get("allowed_attempts")
+    if attempts and attempts > 0:
+        facts.append(f"**Intentos permitidos:** {attempts}")
+    if assignment.get("unlock_at"):
+        facts.append(f"**Disponible desde:** {date_mention(assignment['unlock_at'])}")
+    if assignment.get("lock_at"):
+        facts.append(f"**Cierra:** {date_mention(assignment['lock_at'])}")
+    summary = submission_summary(assignment.get("submission") or {})
+    if summary:
+        facts.append(f"**Tu entrega:** {summary}")
+    return facts
+
+
+def planner_item_details(item, assignments):
+    # Arma el contenido de la página para tareas, quizzes y discusiones.
+    # Lo que tiene tarea asociada sale del índice ya descargado; quizzes y
+    # discusiones sin calificar se piden aparte.
+    ptype, pid = item["plannable_type"], item["plannable_id"]
+    course_id = item.get("course_id")
+    assignment = assignments.get((ptype, pid))
+    facts = assignment_facts(assignment) if assignment else []
+    description = assignment.get("description") if assignment else None
+    rubric = assignment.get("rubric") if assignment else None
+
+    if ptype == "quiz" and course_id:
+        quiz = canvas_get_optional(f"https://{CANVAS_DOMAIN}/api/v1/courses/{course_id}/quizzes/{pid}")
+        if quiz:
+            if quiz.get("time_limit"):
+                facts.append(f"**Tiempo límite:** {quiz['time_limit']} min")
+            if quiz.get("question_count"):
+                facts.append(f"**Preguntas:** {quiz['question_count']}")
+            if not assignment and (quiz.get("allowed_attempts") or 0) > 0:
+                facts.append(f"**Intentos permitidos:** {quiz['allowed_attempts']}")
+            description = description or quiz.get("description")
+    elif ptype == "discussion_topic" and not assignment and course_id:
+        topic = canvas_get_optional(
+            f"https://{CANVAS_DOMAIN}/api/v1/courses/{course_id}/discussion_topics/{pid}"
+        )
+        if topic:
+            description = topic.get("message")
+
+    if not (facts or description or rubric):
+        return ""
+    return details_markdown(description, facts, rubric)
+
+
+def sync_page_details(page_id, details_md):
+    # Escribe o actualiza la sección "Detalles de Canvas" del contenido de la
+    # página sin tocar nada de lo que el estudiante escribió debajo.
+    if not details_md:
+        return
+    ref = hashlib.sha1(details_md.encode("utf-8")).hexdigest()[:10]
+    section = f"{DETAILS_HEADING}\n{details_md}\n\n*{DETAILS_FOOTER} · ref:{ref}*\n---"
+    path = f"pages/{page_id}/markdown"
+
+    try:
+        current = notion_md.request(path=path, method="GET")["markdown"]
+        start = current.find(DETAILS_HEADING)
+        if start == -1:
+            # Página nueva o de antes de esta feature: se agrega arriba de todo.
+            body = {
+                "type": "insert_content",
+                "insert_content": {
+                    "content": f"{section}\n{NOTES_HEADING}\n",
+                    "position": {"type": "start"},
+                },
+            }
+        else:
+            end = current.find(NOTES_HEADING, start)
+            if end == -1:
+                print(f"  ⚠️ No se encontró '{NOTES_HEADING}' en {page_id}; no se actualizan los detalles")
+                return
+            old_section = current[start:end].rstrip("\n")
+            match = DETAILS_REF.search(old_section)
+            if match and match.group(1) == ref:
+                return  # sin cambios en Canvas
+            body = {
+                "type": "update_content",
+                "update_content": {
+                    "content_updates": [{"old_str": old_section, "new_str": section}]
+                },
+            }
+        notion_md.request(path=path, method="PATCH", body=body)
+    except APIResponseError as error:
+        # Que una página con contenido raro no tumbe el sync completo.
+        print(f"  ⚠️ No se pudieron escribir los detalles en {page_id}: {error}")
+
+
 def mark_canvas_complete(item):
     # Refleja un "Done" puesto en Notion de vuelta a Canvas, usando el mismo
     # mecanismo que el checkbox de "marcar como hecho" en el To-Do de Canvas.
@@ -168,7 +411,7 @@ def mark_canvas_complete(item):
     resp.raise_for_status()
 
 
-def upsert_item(data_source_id, item, assignment_grades):
+def upsert_item(data_source_id, item, assignments):
     plannable = item.get("plannable") or {}
     canvas_id = f'{item["plannable_type"]}-{item["plannable_id"]}'
     canvas_complete = bool((item.get("planner_override") or {}).get("marked_complete"))
@@ -183,20 +426,23 @@ def upsert_item(data_source_id, item, assignment_grades):
     if item.get("plannable_date"):
         properties["Due Date"] = {"date": {"start": item["plannable_date"]}}
 
-    if item["plannable_type"] == "assignment":
-        grade = assignment_grades.get(item["plannable_id"])
-        if grade:
-            properties["Grade"] = {
-                "rich_text": [
-                    {
-                        "text": {
-                            "content": format_grade(
-                                grade["score"], grade["points_possible"], grade["letter"]
-                            )
-                        }
+    # Tareas, quizzes y discusiones calificadas: la nota sale de la tarea asociada.
+    assignment = assignments.get((item["plannable_type"], item["plannable_id"])) or {}
+    submission = assignment.get("submission") or {}
+    if submission.get("score") is not None:
+        properties["Grade"] = {
+            "rich_text": [
+                {
+                    "text": {
+                        "content": format_grade(
+                            submission["score"],
+                            assignment.get("points_possible"),
+                            submission.get("grade"),
+                        )
                     }
-                ]
-            }
+                }
+            ]
+        }
 
     existing = find_existing_page(data_source_id, canvas_id)
     name = properties["Name"]["title"][0]["text"]["content"]
@@ -209,16 +455,18 @@ def upsert_item(data_source_id, item, assignment_grades):
         elif canvas_complete and not notion_done:
             # Canvas -> Notion: se marcó como hecho desde el To-Do de Canvas.
             properties["Status"] = {"status": {"name": "Done"}}
-        notion.pages.update(page_id=existing["id"], properties=properties)
+        page = notion.pages.update(page_id=existing["id"], properties=properties)
         print(f"Actualizado: {name}")
     else:
         if canvas_complete:
             properties["Status"] = {"status": {"name": "Done"}}
-        notion.pages.create(
+        page = notion.pages.create(
             parent={"type": "data_source_id", "data_source_id": data_source_id},
             properties=properties,
         )
         print(f"Creado: {name}")
+
+    sync_page_details(page["id"], planner_item_details(item, assignments))
 
 
 def upsert_announcement(data_source_id, announcement, course_names):
@@ -240,14 +488,18 @@ def upsert_announcement(data_source_id, announcement, course_names):
     name = properties["Name"]["title"][0]["text"]["content"]
 
     if existing:
-        notion.pages.update(page_id=existing["id"], properties=properties)
+        page = notion.pages.update(page_id=existing["id"], properties=properties)
         print(f"Actualizado (anuncio): {name}")
     else:
-        notion.pages.create(
+        page = notion.pages.create(
             parent={"type": "data_source_id", "data_source_id": data_source_id},
             properties=properties,
         )
         print(f"Creado (anuncio): {name}")
+
+    author = (announcement.get("author") or {}).get("display_name")
+    facts = [f"**Publicado por:** {escape_text(author)}"] if author else []
+    sync_page_details(page["id"], details_markdown(announcement.get("message"), facts))
 
 
 def upsert_module_resource(data_source_id, course_id, item, course_names):
@@ -266,14 +518,21 @@ def upsert_module_resource(data_source_id, course_id, item, course_names):
     name = properties["Name"]["title"][0]["text"]["content"]
 
     if existing:
-        notion.pages.update(page_id=existing["id"], properties=properties)
+        page = notion.pages.update(page_id=existing["id"], properties=properties)
         print(f"Actualizado (recurso): {name}")
     else:
-        notion.pages.create(
+        page = notion.pages.create(
             parent={"type": "data_source_id", "data_source_id": data_source_id},
             properties=properties,
         )
         print(f"Creado (recurso): {name}")
+
+    # Las páginas de Canvas tienen su contenido propio; el resto de recursos
+    # (archivos, links) se quedan solo con el link.
+    if item.get("type") == "Page" and item.get("url"):
+        canvas_page = canvas_get_optional(item["url"])
+        if canvas_page:
+            sync_page_details(page["id"], details_markdown(canvas_page.get("body")))
 
 
 def upsert_course_grade(data_source_id, course_id, course_name, course_grades):
@@ -350,18 +609,19 @@ def archive_stale_items(data_source_id):
 
 def main():
     data_source_id = get_data_source_id()
+    ensure_schema(data_source_id)
 
     courses = fetch_active_courses()
     course_names = {course["id"]: course.get("name", "General") for course in courses}
     course_ids = list(course_names.keys())
 
-    assignment_grades = fetch_assignment_grades(course_ids)
+    assignments = fetch_assignments(course_ids)
     course_grades = fetch_course_grades()
 
     items = fetch_planner_items()
     print(f"{len(items)} items encontrados en Canvas Planner")
     for item in items:
-        upsert_item(data_source_id, item, assignment_grades)
+        upsert_item(data_source_id, item, assignments)
 
     announcements = fetch_announcements(course_ids)
     print(f"{len(announcements)} anuncios encontrados en cursos activos")

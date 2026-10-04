@@ -14,9 +14,11 @@ Guía completa: ver el post "Canvas + Notion: guía de sincronización" en Notio
    - `NOTION_DATABASE_ID` — el ID de tu base de datos "Canvas Sync" en Notion
    - `ARCHIVE_OVERDUE_AFTER_DAYS` (opcional) — días de gracia antes de archivar tareas vencidas sin completar. Default: `30`.
    - `ANNOUNCEMENTS_LOOKBACK_DAYS` (opcional) — cuántos días atrás de anuncios traer en cada corrida. Default: `30`.
+   - `TIMEZONE` (opcional) — zona horaria para las fechas que aparecen dentro del contenido de cada página (ej. `America/El_Salvador`). Default: `UTC`.
 3. Confirma que la base de datos de Notion tenga estas propiedades: `Name` (title), `Course` (select), `Type` (select), `Due Date` (date), `Status` (status), `Canvas Link` (url), `Canvas ID` (rich text), `Grade` (rich text).
    - `Type` va a ir recibiendo valores nuevos automáticamente (Notion los crea solo): `Assignment`, `Quiz`, `Discussion Topic`, `Calendar Event`, `Announcement`, `File`, `Page`, `External Url`, `External Tool`, `Course Grade`.
 4. Confirma que tu integración de Notion esté conectada a esa base de datos (`···` → Connections).
+   - La integración necesita las capabilities de contenido (leer, insertar y actualizar contenido), que vienen activas por defecto en una integración interna.
 5. Ve a la pestaña **Actions** del repo y corre el workflow "Sync Canvas to Notion" manualmente (`Run workflow`) para probarlo.
 
 ## Correr localmente (opcional)
@@ -37,6 +39,11 @@ python sync.py
 - También trae los cursos activos y sus anuncios (`GET /api/v1/announcements`, últimos `ANNOUNCEMENTS_LOOKBACK_DAYS` días) y los sincroniza como items con `Type = Announcement`.
 - Recorre los módulos de cada curso (`GET /api/v1/courses/:id/modules` + `.../items`) y sincroniza los recursos de contenido (archivos, páginas, enlaces/herramientas externas) con `Type = File/Page/External Url/External Tool`. Los items de módulo que son en realidad tareas/quizzes/discusiones se ignoran acá porque ya llegan por el planner.
 - Trae las notas: por actividad (`GET /api/v1/courses/:id/assignments?include[]=submission`, propia entrega del estudiante) se guardan en la propiedad `Grade` del item de esa tarea; y la nota general por materia (`GET /api/v1/users/self/enrollments`) se sincroniza como una fila aparte por curso con `Type = Course Grade`, que se actualiza en el lugar en cada corrida.
+- Escribe el contenido de cada página en una sección **📌 Detalles de Canvas** al inicio, para no tener que abrir Canvas:
+  - Tareas, quizzes y discusiones: puntos, tipo de entrega, formatos permitidos, intentos, fechas de apertura/cierre, estado de tu entrega, instrucciones completas y rúbrica (como tabla).
+  - Anuncios: el mensaje completo. Páginas de módulos: el contenido de la página.
+  - El HTML de Canvas se convierte a markdown de Notion ([notion_markdown.py](notion_markdown.py)) y se escribe con `PATCH /v1/pages/:id/markdown` (API `2026-03-11`). Las ecuaciones del editor de Canvas quedan como ecuaciones de Notion; las imágenes quedan como link porque requieren sesión de Canvas.
+  - Debajo queda un encabezado **✍️ Mis notas**: todo lo que escribas ahí no se toca. La sección de Canvas se reemplaza solo cuando cambia algo en Canvas (lleva un `ref:` con un hash en su pie), así que no edites dentro de ella.
 - Al final de cada corrida, archiva (Notion `archived: true`, recuperable desde la papelera) las tareas vencidas: de inmediato si ya están en `Done`, o después de `ARCHIVE_OVERDUE_AFTER_DAYS` días si nunca se marcaron como completadas. Anuncios, recursos y notas generales no tienen `Due Date`, así que nunca se archivan solos.
 - Sync bidireccional parcial, limitado al flag de "completado" (nunca toca entregas ni calificaciones):
   - Canvas → Notion: si el item está marcado como hecho en el To-Do de Canvas (`planner_override.marked_complete`), se pone `Status = Done` en Notion.
