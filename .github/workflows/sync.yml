@@ -4,6 +4,10 @@ on:
     - cron: "0 */3 * * *"  # cada 3 horas
   workflow_dispatch: {}     # botón para correrlo manualmente (también desde Notion vía api/trigger.py)
 
+# El sync solo usa sus propios secrets; el GITHUB_TOKEN del job no necesita escribir.
+permissions:
+  contents: read
+
 # Evita que un sync manual y uno programado escriban en Notion a la vez.
 concurrency:
   group: canvas-notion-sync
