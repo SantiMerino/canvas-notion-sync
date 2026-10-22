@@ -79,6 +79,30 @@ Capas, de afuera hacia adentro:
 
 Cualquiera con permiso de edición sobre la página del botón puede ver el header, así que mantén esa página privada. Si el secreto se filtra, genera otro, cámbialo en Vercel y en el botón, y redespliega.
 
+## Estado del sync en Notion (opcional)
+
+Cada corrida (cron o botón) escribe su resultado en una fila `Canvas → Notion` de una base aparte, **Estado de sincronización** ([sync_status.py](sync_status.py)), separada de `Canvas Sync`. Así sabes cuándo terminó el sync que lanzaste con el botón y si encontró cambios.
+
+| Propiedad | Tipo | Qué guarda |
+|---|---|---|
+| `Proceso` | title | `Canvas → Notion` (la fila se crea sola si no existe) |
+| `Estado` | select | `En ejecución`, `Éxito con cambios`, `Éxito sin cambios`, `Completado con avisos`, `Error` |
+| `Último intento` / `Última finalización` | date | inicio y fin de la corrida |
+| `Nuevos` / `Actualizados` | number | páginas creadas / con propiedades o contenido cambiado |
+| `Resultado` | text | resumen: nuevos · actualizados · archivados · avisos (o el tipo de error) |
+| `Corrida GitHub` | url | link a la corrida de Actions |
+
+Setup:
+
+1. Crea la base con esas propiedades y conecta a ella la misma integración de Notion del sync (`···` → Connections).
+2. En GitHub, **Settings → Secrets and variables → Actions → Variables**, agrega `SYNC_STATUS_DATABASE_ID` con el ID de la base (es un ID, no un secreto). Sin esta variable el reporte simplemente no corre.
+
+El reporte es best-effort: si Notion falla o la integración no tiene acceso, el sync sigue igual y el log muestra un aviso. `sync.py` reporta su propio final (incluido `Error` si se cae); si el job falla antes (ej. `pip install`) o se cancela, el último paso del workflow marca `Error`.
+
+## Logs públicos
+
+El repo es público, así que sus logs de Actions también. El script imprime solo conteos (items encontrados, nuevos, actualizados, avisos) y nunca nombres de cursos, tareas o archivos. Los errores se registran solo con su tipo y código HTTP, porque el texto de algunos errores de Canvas incluye URLs de descarga con tokens.
+
 ## Correr localmente (opcional)
 
 ```bash
