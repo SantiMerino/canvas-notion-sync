@@ -21,6 +21,64 @@ Guía completa: ver el post "Canvas + Notion: guía de sincronización" en Notio
    - La integración necesita las capabilities de contenido (leer, insertar y actualizar contenido), que vienen activas por defecto en una integración interna.
 5. Ve a la pestaña **Actions** del repo y corre el workflow "Sync Canvas to Notion" manualmente (`Run workflow`) para probarlo.
 
+## Botón "Sincronizar ahora" en Notion (opcional)
+
+Para forzar un sync sin esperar las 3 horas. Notion no puede llamar la API de GitHub directamente, así que el botón manda un webhook a un relay en Vercel ([api/trigger.py](api/trigger.py)) que valida un secreto y dispara el workflow con `workflow_dispatch`.
+
+```
+Botón de Notion ──POST + X-Trigger-Secret──▶ Vercel /api/trigger ──workflow_dispatch──▶ GitHub Actions ──▶ sync.py
+```
+
+### Setup
+
+1. **Token de GitHub**: crea un *fine-grained token* (Settings → Developer settings → Fine-grained tokens) solo para este repo, con el permiso **Actions: Read and write**. Ponle fecha de expiración.
+2. **Secreto del botón**: genera uno con `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
+3. **Vercel**: importa el repo como proyecto con *Framework Preset* = **Other** (si queda en "Python" el build falla con `PYTHON_ENTRYPOINT_NOT_FOUND`). Agrega en Settings → Environment Variables, solo para **Production** y como *Sensitive*:
+   - `GITHUB_TOKEN` — el token del paso 1
+   - `TRIGGER_SECRET` — el secreto del paso 2
+   - `GITHUB_REPO` (opcional) — `owner/repo`. Default: `SantiMerino/canvas-notion-sync`.
+   - `GITHUB_REF` (opcional) — rama a correr. Default: `master`.
+
+   Después de cambiar variables hay que redesplegar (`vercel deploy --prod --yes` o *Redeploy* en el dashboard). [.vercelignore](.vercelignore) hace que solo se publique `api/`.
+4. **Notion**: agrega un bloque `/button` (ej. "🔄 Sincronizar ahora") con la acción **Send webhook**:
+   - URL: `https://<tu-proyecto>.vercel.app/api/trigger`
+   - Custom header: `X-Trigger-Secret` = el secreto del paso 2
+
+### Uso y verificación
+
+Al pulsar el botón el sync queda en cola en GitHub Actions y Notion se actualiza en ~2–3 min. Notion no muestra si el webhook funcionó; para confirmarlo:
+
+- En **Actions** debe aparecer una corrida nueva con evento `workflow_dispatch` (las automáticas dicen `schedule`), o desde la terminal: `gh run list --workflow sync.yml --limit 3`.
+- Si no aparece, revisa los logs del proyecto en Vercel (`POST /api/trigger`): `401` = el header no coincide con `TRIGGER_SECRET`; `429` = llegaste al límite diario o al tiempo mínimo entre syncs (ver [Límites](#límites)); `403` = lo bloqueó el Firewall; `502` = falla el token de GitHub (permisos o expiró).
+- Prueba manual (en PowerShell usa `curl.exe`, no `curl`):
+  ```bash
+  curl.exe -X POST https://<tu-proyecto>.vercel.app/api/trigger -H "X-Trigger-Secret: <secreto>"
+  ```
+
+### Límites
+
+El cron corre 8 veces al día (cada 3 h); el botón agrega como máximo otras 8, o sea un sync cada ~1.5 h en promedio.
+
+| Límite | Default | Respuesta | Variable en Vercel |
+|---|---|---|---|
+| Syncs manuales en las últimas 24 h | 8 | `429` | `TRIGGER_DAILY_LIMIT` |
+| Tiempo mínimo entre syncs manuales | 10 min | `429` | `TRIGGER_COOLDOWN_MINUTES` |
+
+El contador es el propio historial de GitHub Actions (corridas `workflow_dispatch`), así que no hace falta base de datos; las corridas lanzadas a mano desde GitHub también cuentan. Si GitHub no responde, el relay no dispara (falla cerrado). Además el workflow tiene `concurrency`: como máximo una corrida activa y una en espera.
+
+### Seguridad
+
+Capas, de afuera hacia adentro:
+
+1. **Vercel Firewall** (Settings → Firewall del proyecto), antes de que se ejecute la función:
+   - *Trigger: solo POST con header* — `403` a todo lo que llegue a `/api/trigger` sin ser `POST` o sin el header `X-Trigger-Secret`.
+   - *Trigger: rate limit por IP* — más de 10 llamadas por hora desde una IP reciben `403` durante el resto de esa hora.
+2. **Secreto** — sin el valor exacto de `TRIGGER_SECRET` responde `401` (comparación en tiempo constante). El body del webhook se ignora.
+3. **Cuota** — aun con el secreto, máximo `TRIGGER_DAILY_LIMIT` syncs por 24 h (ver arriba), así que un secreto filtrado no sirve para abusar de Canvas/Notion.
+4. **Alcance del token** — el PAT solo tiene Actions sobre este repo, y el relay solo puede disparar `sync.yml` en `GITHUB_REF`. Las variables son *Sensitive* y solo existen en Production; los previews (incluidos PRs de forks) no las reciben y piden login de Vercel.
+
+Cualquiera con permiso de edición sobre la página del botón puede ver el header, así que mantén esa página privada. Si el secreto se filtra, genera otro, cámbialo en Vercel y en el botón, y redespliega.
+
 ## Correr localmente (opcional)
 
 ```bash
