@@ -2,7 +2,12 @@ name: Sync Canvas to Notion
 on:
   schedule:
     - cron: "0 */3 * * *"  # cada 3 horas
-  workflow_dispatch: {}     # botón para correrlo manualmente
+  workflow_dispatch: {}     # botón para correrlo manualmente (también desde Notion vía api/trigger.py)
+
+# Evita que un sync manual y uno programado escriban en Notion a la vez.
+concurrency:
+  group: canvas-notion-sync
+  cancel-in-progress: false
 
 jobs:
   sync:

@@ -1,0 +1,3 @@
+# Solo se despliega el relay; el sync corre en GitHub Actions.
+/*
+!/api
