@@ -305,7 +305,11 @@ def property_value(prop):
             return (prop[kind] or {}).get("name")
     if "date" in prop:
         start = (prop["date"] or {}).get("start")
-        return datetime.fromisoformat(start.replace("Z", "+00:00")) if start else None
+        if not start:
+            return None
+        # Notion guarda las fechas al minuto: Canvas manda 05:59:59 y Notion
+        # devuelve 05:59:00, así que sin truncar se "actualizaban" en cada corrida.
+        return datetime.fromisoformat(start.replace("Z", "+00:00")).replace(second=0, microsecond=0)
     for kind in ("url", "number", "checkbox"):
         if kind in prop:
             return prop[kind]
