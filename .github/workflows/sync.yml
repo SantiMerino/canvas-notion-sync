@@ -31,3 +31,13 @@ jobs:
           ARCHIVE_OVERDUE_AFTER_DAYS: ${{ secrets.ARCHIVE_OVERDUE_AFTER_DAYS }}
           ANNOUNCEMENTS_LOOKBACK_DAYS: ${{ secrets.ANNOUNCEMENTS_LOOKBACK_DAYS }}
           TIMEZONE: ${{ secrets.TIMEZONE }}
+          SYNC_STATUS_DATABASE_ID: ${{ vars.SYNC_STATUS_DATABASE_ID }}
+      # sync.py reporta su propio final (éxito o error); esto solo cubre lo que
+      # no alcanza a reportar: falla de pip o corrida cancelada. Solo usa stdlib.
+      - name: Reportar falla en Notion
+        if: failure() || cancelled()
+        continue-on-error: true
+        run: python sync_status.py fail "${{ job.status }}"
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          SYNC_STATUS_DATABASE_ID: ${{ vars.SYNC_STATUS_DATABASE_ID }}

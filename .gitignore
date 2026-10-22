@@ -4,3 +4,5 @@ __pycache__/
 
 .vercel
 .env*
+.sync_status_started
+.sync_status_reported

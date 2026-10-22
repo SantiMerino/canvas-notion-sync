@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import requests
 from notion_client import APIResponseError, Client
 
+import sync_status
 from notion_markdown import escape_text, html_to_notion_markdown
 
 CANVAS_DOMAIN = os.environ["CANVAS_DOMAIN"]  # ej. tuescuela.instructure.com
@@ -66,6 +67,31 @@ MODULE_RESOURCE_TYPE_LABELS = {
     "ExternalUrl": "External Url",
     "ExternalTool": "External Tool",
 }
+
+# Conteos de la corrida para el reporte de estado. El repo es público y sus
+# logs de Actions también, así que se imprimen conteos y nunca nombres.
+stats = {"created": 0, "updated": 0, "archived": 0, "warnings": 0}
+
+
+def error_label(error):
+    # Solo tipo y código HTTP: el texto de algunos errores trae URLs de descarga
+    # de Canvas con tokens (verifier=...) que no deben quedar en logs públicos.
+    status = getattr(getattr(error, "response", None), "status_code", None) or getattr(error, "status", None)
+    return f"{type(error).__name__} {status}" if status else type(error).__name__
+
+
+def warn(message, error=None):
+    stats["warnings"] += 1
+    detail = f" ({error_label(error)})" if error else ""
+    print(f"  ⚠️ {message}{detail}")
+
+
+def count_change(existing, *changes):
+    if not existing:
+        stats["created"] += 1
+    elif any(changes):
+        stats["updated"] += 1
+
 
 notion = Client(auth=NOTION_TOKEN)
 # Los endpoints de markdown (/v1/pages/:id/markdown) solo existen desde esta
@@ -148,7 +174,7 @@ def ensure_schema(data_source_id):
             if group is REQUIRED_PROPERTIES:
                 raise
             # Una fórmula inválida no debería frenar el sync.
-            print(f"  ⚠️ No se pudieron crear las fórmulas {', '.join(missing)}: {error}")
+            warn(f"No se pudieron crear las fórmulas {', '.join(missing)}", error)
 
 
 def canvas_get_paginated(url, params=None):
@@ -344,13 +370,14 @@ def upload_to_notion(filename, content, content_type):
 def sync_pdf(page_id, item):
     # Copia el PDF de Canvas dentro de la página de Notion para que Notion AI
     # pueda leerlo. Se sube una sola vez: si la página ya tiene un PDF, no se toca.
+    # Devuelve True si copió el PDF.
     try:
         children = notion.blocks.children.list(block_id=page_id, page_size=50)["results"]
         if any(block["type"] == "pdf" for block in children):
-            return
+            return False
         file_info = canvas_get_optional(item["url"])
         if not file_info or file_info.get("content-type") != "application/pdf" or not file_info.get("url"):
-            return
+            return False
         resp = requests.get(file_info["url"], headers=CANVAS_HEADERS)
         resp.raise_for_status()
         filename = file_info.get("display_name") or file_info.get("filename") or "archivo.pdf"
@@ -365,9 +392,10 @@ def sync_pdf(page_id, item):
                 }
             )
         notion.blocks.children.append(block_id=page_id, children=blocks)
-        print(f"  PDF copiado a Notion: {filename}")
+        return True
     except (APIResponseError, requests.RequestException) as error:
-        print(f"  ⚠️ No se pudo copiar el PDF a {page_id}: {error}")
+        warn(f"No se pudo copiar el PDF a {page_id}", error)
+        return False
 
 
 def build_canvas_link(html_url):
@@ -507,9 +535,10 @@ def planner_item_details(item, assignments):
 
 def sync_page_details(page_id, details_md):
     # Escribe o actualiza la sección "Detalles de Canvas" del contenido de la
-    # página sin tocar nada de lo que el estudiante escribió debajo.
+    # página sin tocar nada de lo que el estudiante escribió debajo. Devuelve
+    # True si escribió algo.
     if not details_md:
-        return
+        return False
     ref = hashlib.sha1(details_md.encode("utf-8")).hexdigest()[:10]
     section = f"{DETAILS_HEADING}\n{details_md}\n\n*{DETAILS_FOOTER} · ref:{ref}*\n---"
     path = f"pages/{page_id}/markdown"
@@ -529,12 +558,12 @@ def sync_page_details(page_id, details_md):
         else:
             end = current.find(NOTES_HEADING, start)
             if end == -1:
-                print(f"  ⚠️ No se encontró '{NOTES_HEADING}' en {page_id}; no se actualizan los detalles")
-                return
+                warn(f"No se encontró '{NOTES_HEADING}' en {page_id}; no se actualizan los detalles")
+                return False
             old_section = current[start:end].rstrip("\n")
             match = DETAILS_REF.search(old_section)
             if match and match.group(1) == ref:
-                return  # sin cambios en Canvas
+                return False  # sin cambios en Canvas
             body = {
                 "type": "update_content",
                 "update_content": {
@@ -542,9 +571,11 @@ def sync_page_details(page_id, details_md):
                 },
             }
         notion_md.request(path=path, method="PATCH", body=body)
+        return True
     except APIResponseError as error:
         # Que una página con contenido raro no tumbe el sync completo.
-        print(f"  ⚠️ No se pudieron escribir los detalles en {page_id}: {error}")
+        warn(f"No se pudieron escribir los detalles en {page_id}", error)
+        return False
 
 
 def mark_canvas_complete(item):
@@ -613,7 +644,7 @@ def upsert_item(data_source_id, item, assignments):
     done_in_canvas = canvas_complete or delivered
 
     existing = find_existing_page(data_source_id, canvas_id)
-    name = properties["Name"]["title"][0]["text"]["content"]
+    changed = False
 
     if existing:
         notion_done = get_notion_status(existing) == "Done"
@@ -624,8 +655,7 @@ def upsert_item(data_source_id, item, assignments):
             # Canvas -> Notion: se entregó o se marcó como hecho en Canvas.
             properties["Status"] = {"status": {"name": "Done"}}
         page = existing
-        if update_page(existing, properties):
-            print(f"Actualizado: {name}")
+        changed = update_page(existing, properties)
     elif is_stale(item.get("plannable_date"), done_in_canvas):
         # Ya se archivó en una corrida anterior (o se archivaría al final de
         # esta): el planner lo sigue devolviendo, pero no se vuelve a crear.
@@ -637,9 +667,9 @@ def upsert_item(data_source_id, item, assignments):
             parent={"type": "data_source_id", "data_source_id": data_source_id},
             properties=properties,
         )
-        print(f"Creado: {name}")
 
-    sync_page_details(page["id"], planner_item_details(item, assignments))
+    details_changed = sync_page_details(page["id"], planner_item_details(item, assignments))
+    count_change(existing, changed, details_changed)
 
 
 def upsert_announcement(data_source_id, announcement, course_names):
@@ -658,22 +688,23 @@ def upsert_announcement(data_source_id, announcement, course_names):
         properties["Due Date"] = {"date": {"start": announcement["posted_at"]}}
 
     existing = find_existing_page(data_source_id, canvas_id)
-    name = properties["Name"]["title"][0]["text"]["content"]
+    changed = False
 
     if existing:
         page = existing
-        if update_page(existing, properties):
-            print(f"Actualizado (anuncio): {name}")
+        changed = update_page(existing, properties)
     else:
         page = notion.pages.create(
             parent={"type": "data_source_id", "data_source_id": data_source_id},
             properties=properties,
         )
-        print(f"Creado (anuncio): {name}")
 
     author = (announcement.get("author") or {}).get("display_name")
     facts = [f"**Publicado por:** {escape_text(author)}"] if author else []
-    sync_page_details(page["id"], details_markdown(announcement.get("message"), facts, heading="Mensaje"))
+    details_changed = sync_page_details(
+        page["id"], details_markdown(announcement.get("message"), facts, heading="Mensaje")
+    )
+    count_change(existing, changed, details_changed)
 
 
 def upsert_module_resource(data_source_id, course_id, item, course_names):
@@ -689,27 +720,29 @@ def upsert_module_resource(data_source_id, course_id, item, course_names):
     }
 
     existing = find_existing_page(data_source_id, canvas_id)
-    name = properties["Name"]["title"][0]["text"]["content"]
+    changed = False
+    content_changed = False
 
     if existing:
         page = existing
-        if update_page(existing, properties):
-            print(f"Actualizado (recurso): {name}")
+        changed = update_page(existing, properties)
     else:
         page = notion.pages.create(
             parent={"type": "data_source_id", "data_source_id": data_source_id},
             properties=properties,
         )
-        print(f"Creado (recurso): {name}")
 
     # Las páginas de Canvas traen su contenido y los PDFs se copian enteros;
     # el resto de recursos (links, otros archivos) se quedan solo con el link.
     if item.get("type") == "Page" and item.get("url"):
         canvas_page = canvas_get_optional(item["url"])
         if canvas_page:
-            sync_page_details(page["id"], details_markdown(canvas_page.get("body"), heading="Contenido"))
+            content_changed = sync_page_details(
+                page["id"], details_markdown(canvas_page.get("body"), heading="Contenido")
+            )
     elif item.get("type") == "File" and item.get("url"):
-        sync_pdf(page["id"], item)
+        content_changed = sync_pdf(page["id"], item)
+    count_change(existing, changed, content_changed)
 
 
 def upsert_course_grade(data_source_id, course_id, course_name, course_grades):
@@ -738,14 +771,13 @@ def upsert_course_grade(data_source_id, course_id, course_name, course_grades):
     existing = find_existing_page(data_source_id, canvas_id)
 
     if existing:
-        if update_page(existing, properties):
-            print(f"Actualizado (nota general): {course_name}")
+        count_change(existing, update_page(existing, properties))
     else:
         notion.pages.create(
             parent={"type": "data_source_id", "data_source_id": data_source_id},
             properties=properties,
         )
-        print(f"Creado (nota general): {course_name}")
+        count_change(existing)
 
 
 def is_stale(due_date, done):
@@ -792,10 +824,11 @@ def archive_stale_items(data_source_id):
             break
         cursor = result.get("next_cursor")
 
+    stats["archived"] = archived_count
     print(f"{archived_count} items archivados (vencidos)")
 
 
-def main():
+def run():
     data_source_id = get_data_source_id()
     ensure_schema(data_source_id)
 
@@ -825,6 +858,36 @@ def main():
         upsert_course_grade(data_source_id, course_id, course_name, course_grades)
 
     archive_stale_items(data_source_id)
+
+
+def summary():
+    return (
+        f"{stats['created']} nuevos · {stats['updated']} actualizados · "
+        f"{stats['archived']} archivados · {stats['warnings']} avisos"
+    )
+
+
+def main():
+    sync_status.report_start()
+    try:
+        run()
+    except Exception as error:
+        sync_status.report_finish(
+            "Error",
+            created=stats["created"],
+            updated=stats["updated"],
+            result=f"Falló: {error_label(error)}. Hasta ese punto: {summary()}.",
+        )
+        raise
+
+    if stats["warnings"]:
+        state = "Completado con avisos"
+    elif stats["created"] or stats["updated"] or stats["archived"]:
+        state = "Éxito con cambios"
+    else:
+        state = "Éxito sin cambios"
+    print(f"{state}: {summary()}")
+    sync_status.report_finish(state, created=stats["created"], updated=stats["updated"], result=summary())
 
 
 if __name__ == "__main__":
